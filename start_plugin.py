@@ -12,8 +12,8 @@ async def start_qq_auto_reply():
     print("启动 QQ 自动回复插件")
     print("="*60)
 
-    # NEKO Agent Server 插件 API
-    plugin_api = "http://localhost:48915/plugin/execute"
+    # NEKO 插件服务器 API
+    plugin_api = "http://localhost:48916/runs"
 
     try:
         async with httpx.AsyncClient() as client:

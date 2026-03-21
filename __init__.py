@@ -5,22 +5,15 @@ import asyncio
 import json
 import os
 import random
+import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from plugin.sdk.base import NekoPluginBase
-from plugin.sdk.decorators import lifecycle, neko_plugin, plugin_entry
-from plugin.sdk import ok, fail
+from plugin.sdk.plugin import NekoPluginBase, lifecycle, neko_plugin, plugin_entry, Ok, Err, SdkError
 
 from .qq_client import QQClient
 from .permission import PermissionManager
 from .group_permission import GroupPermissionManager
 
-try:
-    import tomli
-    import tomli_w
-except ImportError:
-    import tomllib as tomli
-    import tomli_w
 
 
 @neko_plugin
@@ -40,7 +33,11 @@ class QQAutoReplyPlugin(NekoPluginBase):
 
         # Normal 权限转述功能
         self._admin_qq: Optional[str] = None
-        self._normal_relay_probability: float = 0.3
+        self._normal_relay_probability: float = 0.1
+
+        # NapCat 进程管理
+        self._napcat_process: Optional[asyncio.subprocess.Process] = None
+        self._napcat_log_task: Optional[asyncio.Task] = None
 
     @lifecycle(id="startup")
     async def startup(self, **_):
@@ -49,12 +46,25 @@ class QQAutoReplyPlugin(NekoPluginBase):
         cfg = cfg if isinstance(cfg, dict) else {}
         qq_cfg = cfg.get("qq_auto_reply", {})
 
-        # 初始化权限管理器
-        trusted_users = qq_cfg.get("trusted_users", [])
+        # 启动 NapCat.Shell
+        await self._start_napcat()
+
+        # 初始化权限管理器（优先从 store 加载，回退到 TOML 配置）
+        store_users_result = await self.store.get("trusted_users")
+        if isinstance(store_users_result, Ok) and store_users_result.value is not None:
+            trusted_users = store_users_result.value
+            self.logger.info(f"从 store 加载 {len(trusted_users)} 个信任用户")
+        else:
+            trusted_users = qq_cfg.get("trusted_users", [])
         self.permission_mgr = PermissionManager(trusted_users)
 
-        # 初始化群聊权限管理器
-        trusted_groups = qq_cfg.get("trusted_groups", [])
+        # 初始化群聊权限管理器（优先从 store 加载，回退到 TOML 配置）
+        store_groups_result = await self.store.get("trusted_groups")
+        if isinstance(store_groups_result, Ok) and store_groups_result.value is not None:
+            trusted_groups = store_groups_result.value
+            self.logger.info(f"从 store 加载 {len(trusted_groups)} 个信任群聊")
+        else:
+            trusted_groups = qq_cfg.get("trusted_groups", [])
         self.group_permission_mgr = GroupPermissionManager(trusted_groups)
 
         # 获取管理员 QQ（用于转述）
@@ -64,15 +74,16 @@ class QQAutoReplyPlugin(NekoPluginBase):
                 break
 
         # 获取转述概率
-        self._normal_relay_probability = qq_cfg.get("normal_relay_probability", 0.3)
+        self._normal_relay_probability = qq_cfg.get("normal_relay_probability", 0.1)
 
         # 初始化 QQ 客户端
         onebot_url = qq_cfg.get("onebot_url", "ws://127.0.0.1:3001")
-        token = qq_cfg.get("token")
-        self.qq_client = QQClient(onebot_url, token, self.logger)
+        token = qq_cfg.get("token", "")
+        self.qq_client = QQClient(onebot_url=onebot_url, token=token, logger=self.logger)
+        self.logger.info(f"QQ 客户端已初始化: {onebot_url}")
 
-        self.logger.info(f"QQ Auto Reply Plugin started (Admin QQ: {self._admin_qq}, Relay Probability: {self._normal_relay_probability})")
-        return ok(data={"status": "running"})
+
+        return Ok({"status": "running"})
 
     @lifecycle(id="shutdown")
     async def shutdown(self, **_):
@@ -80,13 +91,17 @@ class QQAutoReplyPlugin(NekoPluginBase):
         await self.stop_auto_reply()
         if self.qq_client:
             await self.qq_client.disconnect()
+
+        # 停止 NapCat.Shell
+        await self._stop_napcat()
+
         self.logger.info("QQ Auto Reply Plugin shutdown")
-        return ok(data={"status": "shutdown"})
+        return Ok({"status": "shutdown"})
 
     @plugin_entry(
         id="start_auto_reply",
         name="启动自动回复",
-        description="开始监听 QQ 消息并自动回复。连接到 OneBot 服务（NapCat/LLOneBot），接收消息后根据权限等级生成 AI 回复。",
+        description="用户说'启动'、'开始'、'开启自动回复'、'启动 QQ 监听'时调用此功能。开始监听 QQ 消息并自动回复。接收消息后根据权限等级生成 AI 回复。",
         input_schema={
             "type": "object",
             "properties": {},
@@ -95,13 +110,13 @@ class QQAutoReplyPlugin(NekoPluginBase):
     async def start_auto_reply(self, **_):
         """启动自动回复功能"""
         if self._running:
-            return fail("ALREADY_RUNNING", "自动回复已在运行中")
+            return Ok({"status": "already_running"})
 
         if not self.qq_client:
-            return fail("NOT_INITIALIZED", "QQ 客户端未初始化")
+            return Err(SdkError("NOT_INITIALIZED: QQ 客户端未初始化"))
 
         try:
-            # 连接到 OneBot 服务（NapCat/LLOneBot 等）
+            # 连接到 NapCat 服务
             await self.qq_client.connect()
 
             # 启动消息处理任务
@@ -109,15 +124,15 @@ class QQAutoReplyPlugin(NekoPluginBase):
             self._message_task = asyncio.create_task(self._process_messages())
 
             self.logger.info("Auto reply started")
-            return ok(data={"status": "started"})
+            return Ok({"status": "started"})
         except Exception as e:
             self.logger.exception("Failed to start auto reply")
-            return fail("START_ERROR", f"启动失败: {e}")
+            return Err(SdkError(f"START_ERROR: 启动失败: {e}"))
 
     @plugin_entry(
         id="stop_auto_reply",
         name="停止自动回复",
-        description="停止监听 QQ 消息，断开与 OneBot 服务的连接。",
+        description="stop。停止监听 QQ 消息，断开与 OneBot 服务的连接。用户说'停止'、'关闭'、'停止自动回复'时调用此功能。",
         input_schema={
             "type": "object",
             "properties": {},
@@ -126,7 +141,7 @@ class QQAutoReplyPlugin(NekoPluginBase):
     async def stop_auto_reply(self, **_):
         """停止自动回复功能"""
         if not self._running:
-            return ok(data={"status": "not_running"})
+            return Ok({"status": "not_running"})
 
         self._running = False
         if self._message_task:
@@ -138,7 +153,7 @@ class QQAutoReplyPlugin(NekoPluginBase):
             self._message_task = None
 
         self.logger.info("Auto reply stopped")
-        return ok(data={"status": "stopped"})
+        return Ok({"status": "stopped"})
 
     async def _process_messages(self):
         """处理接收到的 QQ 消息"""
@@ -248,8 +263,21 @@ class QQAutoReplyPlugin(NekoPluginBase):
             except Exception as e:
                 self.logger.error(f"Failed to send group message via OneBot: {e}")
 
+    @staticmethod
+    def _sanitize_message_text(text: str) -> str:
+        """将 CQ 码中的 at 替换为可读文本，避免 AI 误解"""
+        import re
+        # [CQ:at,qq=all] -> @全体成员
+        text = re.sub(r'\[CQ:at,qq=all\]', '@全体成员', text)
+        # [CQ:at,qq=12345] -> @用户12345
+        text = re.sub(r'\[CQ:at,qq=(\d+)\]', r'@用户\1', text)
+        return text
+
     async def _handle_normal_relay(self, message_text: str, sender_id: str, source_type: str, source_id: str):
         """处理 Normal 权限的转述逻辑"""
+        # 清理 CQ 码，避免 AI 误解 @ 对象
+        message_text = self._sanitize_message_text(message_text)
+
         # 检查是否有管理员
         if not self._admin_qq:
             self.logger.debug("No admin QQ configured, skipping relay")
@@ -260,7 +288,7 @@ class QQAutoReplyPlugin(NekoPluginBase):
             self.logger.debug(f"Relay not triggered (probability: {self._normal_relay_probability})")
             return
 
-        self.logger.info(f"🔔 Relay triggered for {source_type} {source_id}, user {sender_id}")
+        self.logger.info(f"Relay triggered for {source_type} {source_id}, user {sender_id}")
 
         # 生成转述给主人的回复
         try:
@@ -330,7 +358,6 @@ class QQAutoReplyPlugin(NekoPluginBase):
 - 请用简短自然的话（不超过50字）告诉{master_name if master_name else "主人"}这件事
 - 不要使用 Markdown 格式，不要使用表情符号
 - 记住你是 {her_name}，以 {her_name} 的身份转述
-- 例如："主人，我刚看到有人说xxx很好吃呢，要不要试试？"
 ======场景说明结束======""")
 
             system_prompt = "\n".join(system_prompt_parts)
@@ -354,12 +381,12 @@ class QQAutoReplyPlugin(NekoPluginBase):
                 # 发送给管理员
                 try:
                     await self.qq_client.send_message(self._admin_qq, relay_text)
-                    self.logger.info(f"✅ Relayed to admin {self._admin_qq}: {relay_text[:50]}...")
+                    self.logger.info(f"Relayed to admin {self._admin_qq}: {relay_text[:50]}...")
                 except Exception as e:
                     self.logger.error(f"Failed to relay to admin: {e}")
 
             # 断开临时会话
-            await temp_session.disconnect()
+            await temp_session.close()
 
         except Exception as e:
             self.logger.error(f"Failed to generate relay message: {e}")
@@ -386,7 +413,7 @@ class QQAutoReplyPlugin(NekoPluginBase):
             # 获取角色完整数据
             master_name, her_name, _, catgirl_data, _, lanlan_prompt_map, _, _, _ = config_manager.get_character_data()
 
-            # 🔥 获取用户称呼
+            # 获取用户称呼
             # 1. 优先使用插件设置的昵称
             custom_nickname = self.permission_mgr.get_nickname(sender_id)
 
@@ -459,7 +486,7 @@ class QQAutoReplyPlugin(NekoPluginBase):
                     on_text_delta=on_text_delta
                 )
 
-                # 🔥 使用与前端完全一致的提示词结构
+                # 使用与前端完全一致的提示词结构
                 from config.prompts_sys import SESSION_INIT_PROMPT
                 from utils.language_utils import get_global_language
 
@@ -543,7 +570,7 @@ class QQAutoReplyPlugin(NekoPluginBase):
             ai_reply = ''.join(reply_chunks).strip()
 
             if ai_reply:
-                # 🔥 只有私聊且管理员权限的对话才同步到记忆系统
+                # 只有私聊且管理员权限的对话才同步到记忆系统
                 # 群聊消息不进入记忆
                 if not is_group and permission_level == "admin":
                     try:
@@ -551,8 +578,6 @@ class QQAutoReplyPlugin(NekoPluginBase):
                         conversation_history = user_session._conversation_history
 
                         # 只同步最新的用户消息和 AI 回复（增量同步）
-                        # conversation_history 格式: [SystemMessage, HumanMessage, AIMessage, ...]
-                        # 我们需要最后两条消息（user + assistant）
                         if len(conversation_history) >= 2:
                             # 转换为 Memory Server 期望的格式
                             recent_messages = []
@@ -576,17 +601,17 @@ class QQAutoReplyPlugin(NekoPluginBase):
                                 if response.status_code == 200:
                                     result = response.json()
                                     count = result.get('count', 0)
-                                    self.logger.info(f"✅ [管理员] 成功同步 {count} 条消息到 Memory Server (用户: {sender_id})")
+                                    self.logger.info(f" [管理员] 成功同步 {count} 条消息到 Memory Server (用户: {sender_id})")
                                 else:
-                                    self.logger.warning(f"⚠️ Memory Server 返回错误: {response.status_code}")
+                                    self.logger.warning(f" Memory Server 返回错误: {response.status_code}")
 
                     except Exception as e:
-                        self.logger.error(f"⚠️ 记忆同步失败（不影响回复）: {e}")
+                        self.logger.error(f"记忆同步失败: {e}")
                 else:
                     if is_group:
-                        self.logger.info(f"ℹ️ [群聊] 跳过记忆同步 (群: {group_id}, 用户: {sender_id})")
+                        self.logger.info(f"[群聊] 跳过记忆同步 (群: {group_id}, 用户: {sender_id})")
                     else:
-                        self.logger.info(f"ℹ️ [非管理员] 跳过记忆同步 (用户: {sender_id}, 权限: {permission_level})")
+                        self.logger.info(f"[非管理员] 跳过记忆同步 (用户: {sender_id}, 权限: {permission_level})")
 
                 self.logger.info(f"AI 生成回复: {ai_reply[:50]}...")
                 return ai_reply
@@ -600,72 +625,32 @@ class QQAutoReplyPlugin(NekoPluginBase):
 
 
     async def _save_trusted_users_to_config(self):
-        """持久化信任用户列表到 plugin.toml"""
+        """持久化信任用户列表到 store"""
         try:
-            # 获取 plugin.toml 路径
-            plugin_dir = Path(__file__).parent
-            config_path = plugin_dir / "plugin.toml"
-
-            # 读取现有配置
-            with open(config_path, "rb") as f:
-                config = tomli.load(f)
-
-            # 获取当前用户列表
             users = self.permission_mgr.list_users()
-
-            # 更新配置
-            if "qq_auto_reply" not in config:
-                config["qq_auto_reply"] = {}
-
-            config["qq_auto_reply"]["trusted_users"] = users
-
-            # 写回文件
-            with open(config_path, "wb") as f:
-                tomli_w.dump(config, f)
-
-            self.logger.info(f"✅ 成功持久化 {len(users)} 个信任用户到配置文件")
+            await self.store.set("trusted_users", users)
+            self.logger.info(f"成功持久化 {len(users)} 个信任用户到 store")
             return True
-
         except Exception as e:
-            self.logger.error(f"❌ 持久化配置失败: {e}")
+            self.logger.error(f"持久化配置失败: {e}")
             return False
 
     async def _save_trusted_groups_to_config(self):
-        """持久化信任群聊列表到 plugin.toml"""
+        """持久化信任群聊列表到 store"""
         try:
-            # 获取 plugin.toml 路径
-            plugin_dir = Path(__file__).parent
-            config_path = plugin_dir / "plugin.toml"
-
-            # 读取现有配置
-            with open(config_path, "rb") as f:
-                config = tomli.load(f)
-
-            # 获取当前群聊列表
             groups = self.group_permission_mgr.list_groups()
-
-            # 更新配置
-            if "qq_auto_reply" not in config:
-                config["qq_auto_reply"] = {}
-
-            config["qq_auto_reply"]["trusted_groups"] = groups
-
-            # 写回文件
-            with open(config_path, "wb") as f:
-                tomli_w.dump(config, f)
-
-            self.logger.info(f"✅ 成功持久化 {len(groups)} 个信任群聊到配置文件")
+            await self.store.set("trusted_groups", groups)
+            self.logger.info(f"成功持久化 {len(groups)} 个信任群聊到 store")
             return True
-
         except Exception as e:
-            self.logger.error(f"❌ 持久化群聊配置失败: {e}")
+            self.logger.error(f"持久化群聊配置失败: {e}")
             return False
 
 
     @plugin_entry(
         id="add_trusted_user",
         name="添加信任用户",
-        description="添加一个信任的 QQ 号到白名单。支持三种权限等级：admin（管理员）、trusted（信任用户）、normal（普通用户）。可选设置昵称。",
+        description="【用户管理】添加一个信任的 QQ 号到白名单。支持三种权限等级：admin（管理员）、trusted（信任用户）、normal（普通用户）。可选设置昵称。用户说'添加用户'、'添加 QQ 号'、'添加信任用户'时调用。注意：这不是启动服务的功能。",
         input_schema={
             "type": "object",
             "properties": {
@@ -688,9 +673,9 @@ class QQAutoReplyPlugin(NekoPluginBase):
         },
     )
     async def add_trusted_user(self, qq_number: str, level: str = "trusted", nickname: str = "", **_):
-        """添加信任用户并持久化到配置文件"""
+        """添加信任用户并持久化到 store"""
         if not self.permission_mgr:
-            return fail("NOT_INITIALIZED", "权限管理器未初始化")
+            return Err(SdkError("NOT_INITIALIZED: 权限管理器未初始化"))
 
         # 添加到内存（管理员不设置昵称）
         user_nickname = "" if level == "admin" else nickname
@@ -698,33 +683,24 @@ class QQAutoReplyPlugin(NekoPluginBase):
         self.logger.info(f"Added trusted user: {qq_number} with level {level}" +
                         (f" and nickname {user_nickname}" if user_nickname else ""))
 
-        # 持久化到配置文件
+        # 持久化到 store
         success = await self._save_trusted_users_to_config()
 
-        if success:
-            result_data = {
-                "qq_number": qq_number,
-                "level": level,
-                "persisted": True
-            }
-            if user_nickname:
-                result_data["nickname"] = user_nickname
-            return ok(data=result_data)
-        else:
-            result_data = {
-                "qq_number": qq_number,
-                "level": level,
-                "persisted": False,
-                "warning": "已添加到内存，但持久化失败"
-            }
-            if user_nickname:
-                result_data["nickname"] = user_nickname
-            return ok(data=result_data)
+        result_data = {
+            "qq_number": qq_number,
+            "level": level,
+            "persisted": success,
+        }
+        if user_nickname:
+            result_data["nickname"] = user_nickname
+        if not success:
+            result_data["warning"] = "已添加到内存，但持久化失败"
+        return Ok(result_data)
 
     @plugin_entry(
         id="remove_trusted_user",
         name="移除信任用户",
-        description="从白名单中移除一个 QQ 号，移除后该用户将无法触发自动回复。",
+        description="【用户管理】从白名单中移除一个 QQ 号，移除后该用户将无法触发自动回复。用户说'移除用户'、'删除用户'时调用。",
         input_schema={
             "type": "object",
             "properties": {
@@ -737,50 +713,37 @@ class QQAutoReplyPlugin(NekoPluginBase):
         },
     )
     async def remove_trusted_user(self, qq_number: str, **_):
-        """移除信任用户并持久化到配置文件"""
+        """移除信任用户并持久化到 store"""
         if not self.permission_mgr:
-            return fail("NOT_INITIALIZED", "权限管理器未初始化")
+            return Err(SdkError("NOT_INITIALIZED: 权限管理器未初始化"))
 
-        # 从内存中移除
         self.permission_mgr.remove_user(qq_number)
         self.logger.info(f"Removed trusted user: {qq_number}")
 
-        # 持久化到配置文件
         success = await self._save_trusted_users_to_config()
-
-        if success:
-            return ok(data={
-                "qq_number": qq_number,
-                "persisted": True
-            })
-        else:
-            return ok(data={
-                "qq_number": qq_number,
-                "persisted": False,
-                "warning": "已从内存移除，但持久化失败"
-            })
+        result = {"qq_number": qq_number, "persisted": success}
+        if not success:
+            result["warning"] = "已从内存移除，但持久化失败"
+        return Ok(result)
 
     @plugin_entry(
         id="list_trusted_users",
         name="列出信任用户",
-        description="列出所有在白名单中的 QQ 号及其权限等级。",
-        input_schema={
-            "type": "object",
-            "properties": {},
-        },
+        description="【用户管理】列出所有信任用户及其权限等级。用户说'列出用户'、'查看用户列表'时调用。",
+        input_schema={"type": "object", "properties": {}},
     )
     async def list_trusted_users(self, **_):
         """列出所有信任用户"""
         if not self.permission_mgr:
-            return fail("NOT_INITIALIZED", "权限管理器未初始化")
+            return Err(SdkError("NOT_INITIALIZED: 权限管理器未初始化"))
 
         users = self.permission_mgr.list_users()
-        return ok(data={"users": users})
+        return Ok({"users": users})
 
     @plugin_entry(
         id="set_user_nickname",
         name="设置用户昵称",
-        description="为信任用户设置专属称呼。管理员始终被称为主人，其他用户可以设置自定义昵称。",
+        description="【用户管理】为信任用户设置专属称呼。管理员始终被称为主人，其他用户可以设置自定义昵称。用户说'设置昵称'、'修改昵称'时调用。",
         input_schema={
             "type": "object",
             "properties": {
@@ -797,49 +760,38 @@ class QQAutoReplyPlugin(NekoPluginBase):
         },
     )
     async def set_user_nickname(self, qq_number: str, nickname: str = "", **_):
-        """设置用户昵称并持久化到配置文件"""
+        """设置用户昵称并持久化到 store"""
         if not self.permission_mgr:
-            return fail("NOT_INITIALIZED", "权限管理器未初始化")
+            return Err(SdkError("NOT_INITIALIZED: 权限管理器未初始化"))
 
-        # 检查用户是否存在
         permission_level = self.permission_mgr.get_permission_level(qq_number)
         if permission_level == "none":
-            return fail("USER_NOT_FOUND", f"用户 {qq_number} 不在信任列表中")
+            return Err(SdkError(f"USER_NOT_FOUND: 用户 {qq_number} 不在信任列表中"))
 
-        # 管理员不能设置昵称（始终是主人）
         if permission_level == "admin":
-            return fail("ADMIN_NO_NICKNAME", "管理员始终被称为主人，无法设置昵称")
+            return Err(SdkError("ADMIN_NO_NICKNAME: 管理员始终被称为主人，无法设置昵称"))
 
-        # 设置昵称
         success = self.permission_mgr.set_nickname(qq_number, nickname)
-
         if not success:
-            return fail("SET_FAILED", "设置昵称失败")
+            return Err(SdkError("SET_FAILED: 设置昵称失败"))
 
-        # 持久化到配置文件
         persist_success = await self._save_trusted_users_to_config()
-
         action = "清除" if not nickname else "设置"
         self.logger.info(f"{action}用户 {qq_number} 的昵称: {nickname}")
 
-        if persist_success:
-            return ok(data={
-                "qq_number": qq_number,
-                "nickname": nickname if nickname else None,
-                "persisted": True
-            })
-        else:
-            return ok(data={
-                "qq_number": qq_number,
-                "nickname": nickname if nickname else None,
-                "persisted": False,
-                "warning": "已在内存中更新，但持久化失败"
-            })
+        result = {
+            "qq_number": qq_number,
+            "nickname": nickname if nickname else None,
+            "persisted": persist_success,
+        }
+        if not persist_success:
+            result["warning"] = "已在内存中更新，但持久化失败"
+        return Ok(result)
 
     @plugin_entry(
         id="add_trusted_group",
         name="添加信任群聊",
-        description="添加一个信任的 QQ 群到白名单。支持两种等级：trusted（信任群聊）、normal（普通群聊）。",
+        description="用户说'添加群聊'、'添加 QQ 群'时调用。添加一个信任的 QQ 群到白名单。支持两种等级：trusted（信任群聊）、normal（普通群聊）。",
         input_schema={
             "type": "object",
             "properties": {
@@ -857,35 +809,23 @@ class QQAutoReplyPlugin(NekoPluginBase):
         },
     )
     async def add_trusted_group(self, group_id: str, level: str = "normal", **_):
-        """添加信任群聊并持久化到配置文件"""
+        """添加信任群聊并持久化到 store"""
         if not self.group_permission_mgr:
-            return fail("NOT_INITIALIZED", "群聊权限管理器未初始化")
+            return Err(SdkError("NOT_INITIALIZED: 群聊权限管理器未初始化"))
 
-        # 添加到内存
         self.group_permission_mgr.add_group(group_id, level)
         self.logger.info(f"Added trusted group: {group_id} with level {level}")
 
-        # 持久化到配置文件
         success = await self._save_trusted_groups_to_config()
-
-        if success:
-            return ok(data={
-                "group_id": group_id,
-                "level": level,
-                "persisted": True
-            })
-        else:
-            return ok(data={
-                "group_id": group_id,
-                "level": level,
-                "persisted": False,
-                "warning": "已添加到内存，但持久化失败"
-            })
+        result = {"group_id": group_id, "level": level, "persisted": success}
+        if not success:
+            result["warning"] = "已添加到内存，但持久化失败"
+        return Ok(result)
 
     @plugin_entry(
         id="remove_trusted_group",
         name="移除信任群聊",
-        description="从白名单中移除一个 QQ 群，移除后该群将无法触发自动回复。",
+        description="用户说'移除群聊'、'删除群聊'时调用。从白名单中移除一个 QQ 群，移除后该群将无法触发自动回复。",
         input_schema={
             "type": "object",
             "properties": {
@@ -898,42 +838,182 @@ class QQAutoReplyPlugin(NekoPluginBase):
         },
     )
     async def remove_trusted_group(self, group_id: str, **_):
-        """移除信任群聊并持久化到配置文件"""
+        """移除信任群聊并持久化到 store"""
         if not self.group_permission_mgr:
-            return fail("NOT_INITIALIZED", "群聊权限管理器未初始化")
+            return Err(SdkError("NOT_INITIALIZED: 群聊权限管理器未初始化"))
 
-        # 从内存中移除
         self.group_permission_mgr.remove_group(group_id)
         self.logger.info(f"Removed trusted group: {group_id}")
 
-        # 持久化到配置文件
         success = await self._save_trusted_groups_to_config()
-
-        if success:
-            return ok(data={
-                "group_id": group_id,
-                "persisted": True
-            })
-        else:
-            return ok(data={
-                "group_id": group_id,
-                "persisted": False,
-                "warning": "已从内存移除，但持久化失败"
-            })
+        result = {"group_id": group_id, "persisted": success}
+        if not success:
+            result["warning"] = "已从内存移除，但持久化失败"
+        return Ok(result)
 
     @plugin_entry(
         id="list_trusted_groups",
         name="列出信任群聊",
-        description="列出所有在白名单中的 QQ 群及其权限等级。",
-        input_schema={
-            "type": "object",
-            "properties": {},
-        },
+        description="【群聊管理】列出所有信任群聊及其权限等级。用户说'列出群聊'、'查看群聊列表'时调用。",
+        input_schema={"type": "object", "properties": {}},
     )
     async def list_trusted_groups(self, **_):
         """列出所有信任群聊"""
         if not self.group_permission_mgr:
-            return fail("NOT_INITIALIZED", "群聊权限管理器未初始化")
+            return Err(SdkError("NOT_INITIALIZED: 群聊权限管理器未初始化"))
 
         groups = self.group_permission_mgr.list_groups()
-        return ok(data={"groups": groups})
+        return Ok({"groups": groups})
+    
+    @plugin_entry(
+        id="start_napcat_foreground",
+        name="前台启动 NapCat",
+        description="用户说'前台启动'、'显示窗口启动'、'手动登录 QQ'时调用。前台启动 NapCat 并显示窗口，用于首次登录 QQ 或需要扫码验证时。",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "show_window": {
+                    "type": "boolean",
+                    "description": "是否显示窗口（true=前台启动，false=后台启动）",
+                    "default": True
+                }
+            }
+        },
+    )
+    async def start_napcat_foreground(self, show_window: bool = True, **_):
+        """前台启动 NapCat（用于登录）"""
+        await self._start_napcat(show_window=show_window)
+        mode = "前台" if show_window else "后台"
+        return Ok({
+            "status": "started",
+            "mode": mode,
+            "message": f"NapCat 已{mode}启动，请在弹出的窗口中登录 QQ" if show_window else f"NapCat 已{mode}启动"
+        })
+
+    async def _start_napcat(self, show_window: bool = False):
+        """启动 NapCat
+
+        Args:
+            show_window: 是否显示窗口（True=前台启动，用于登录；False=后台启动）
+        """
+        try:
+            # 获取 NapCat.Shell 目录
+            plugin_dir = Path(__file__).parent
+            napcat_dir = plugin_dir / "NapCat.Shell"
+            launcher_script = napcat_dir / "launcher.bat"
+
+            if not launcher_script.exists():
+                self.logger.warning(f"NapCat launcher not found: {launcher_script}")
+                return
+
+            mode = "前台" if show_window else "后台"
+            self.logger.info(f"Starting NapCat ({mode}模式) from {napcat_dir}")
+
+            # 根据参数决定是否显示窗口
+            if show_window:
+                # 前台启动：直接运行 launcher.bat，显示窗口（用于登录）
+                self._napcat_process = await asyncio.create_subprocess_exec(
+                    str(launcher_script),
+                    cwd=str(napcat_dir),
+                )
+            else:
+                # 后台启动：隐藏窗口但保持 PIPE 输出
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                startupinfo.wShowWindow = subprocess.SW_HIDE
+                self._napcat_process = await asyncio.create_subprocess_exec(
+                    "cmd", "/c", str(launcher_script),
+                    cwd=str(napcat_dir),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    startupinfo=startupinfo,
+                )
+
+            self.logger.info(f" NapCat started ({mode}模式, PID: {self._napcat_process.pid if self._napcat_process else 'N/A'})")
+
+            # 启动输出捕获任务（仅后台模式有 PIPE）
+            if not show_window and self._napcat_process:
+                self._napcat_log_task = asyncio.create_task(self._pipe_napcat_output())
+
+            # 等待 NapCat 启动（给它一些时间初始化）
+            await asyncio.sleep(5)
+
+        except Exception as e:
+            self.logger.error(f"Failed to start NapCat: {e}")
+
+    async def _pipe_napcat_output(self):
+        """持续读取 NapCat 的 stdout/stderr 并写入插件日志"""
+        proc = self._napcat_process
+        if not proc:
+            return
+
+        async def read_stream(stream, prefix: str):
+            while True:
+                line = await stream.readline()
+                if not line:
+                    break
+                text = line.decode("utf-8", errors="replace").rstrip()
+                if text:
+                    self.logger.info(f"[NapCat] {prefix}{text}")
+
+        try:
+            await asyncio.gather(
+                read_stream(proc.stdout, ""),
+                read_stream(proc.stderr, "[ERR] "),
+            )
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            self.logger.error(f"NapCat output pipe error: {e}")
+
+
+    @plugin_entry(
+        id="stop_napcat",
+        name="停止 NapCat",
+        description="用户说'停止 NapCat'、'关闭 NapCat'时调用。停止 NapCat 进程并断开连接。",
+        input_schema={
+            "type": "object",
+        },
+    )
+    async def stop_napcat(self, **_):
+        """停止 NapCat"""
+        await self._stop_napcat()
+        return Ok({"status": "stopped"})
+
+    async def _stop_napcat(self):
+        """停止 NapCat"""
+        # 停止日志捕获任务
+        if self._napcat_log_task:
+            self._napcat_log_task.cancel()
+            try:
+                await self._napcat_log_task
+            except asyncio.CancelledError:
+                pass
+            self._napcat_log_task = None
+
+        # 用 KillQQ.bat 终止 QQ 进程
+        try:
+            self.logger.info("Stopping NapCat via KillQQ.bat...")
+            plugin_dir = Path(__file__).parent
+            kill_script = plugin_dir / "NapCat.Shell" / "KillQQ.bat"
+            if kill_script.exists():
+                kill_proc = await asyncio.create_subprocess_exec(
+                    str(kill_script),
+                    cwd=str(kill_script.parent),
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await asyncio.wait_for(kill_proc.wait(), timeout=5.0)
+                self.logger.info("KillQQ.bat executed")
+            else:
+                self.logger.warning("KillQQ.bat not found, falling back to taskkill QQ.exe")
+                kill_proc = await asyncio.create_subprocess_exec(
+                    "taskkill", "/F", "/IM", "QQ.exe",
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await asyncio.wait_for(kill_proc.wait(), timeout=5.0)
+        except Exception as e:
+            self.logger.error(f"Failed to stop NapCat: {e}")
+
+        self._napcat_process = None

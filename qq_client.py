@@ -63,10 +63,15 @@ class QQClient:
             self.logger.info("Disconnected from OneBot")
 
     async def _receive_loop(self):
-        """接收消息循环"""
-        while self.ws:
+        """接收消息循环（含断线重连）"""
+        retry_delay = 1.0
+        while True:
+            if not self.ws:
+                break
             try:
                 raw_message = await self.ws.recv()
+                retry_delay = 1.0  # 收到消息说明连接正常，重置重试间隔
+
                 message = json.loads(raw_message)
 
                 # 调试：打印所有收到的消息
@@ -89,8 +94,15 @@ class QQClient:
                 break
             except Exception as e:
                 if self.logger:
-                    self.logger.error(f"Error receiving message: {e}")
-                await asyncio.sleep(1)
+                    self.logger.warning(f"WebSocket disconnected: {e}, reconnecting in {retry_delay:.0f}s...")
+                self.ws = None
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, 30.0)  # 指数退避，最长30秒
+                try:
+                    await self.connect()
+                except Exception as ce:
+                    if self.logger:
+                        self.logger.error(f"Reconnect failed: {ce}")
 
     async def receive_message(self, timeout: float = 1.0) -> Optional[Dict[str, Any]]:
         """接收一条消息，返回标准化格式"""
